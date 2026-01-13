@@ -1,0 +1,41 @@
+# .dockerignore
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Training outputs
+models/
+logs/
+ppo_mario_tensorboard/
+*.zip
+
+# Environment
+.env
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Git
+.git/
+.gitignore
+
+# Conda
+.conda/
+
+# Documentation (wird kopiert wenn benötigt)
+Fehlerbehebung_Zusammenfassung.md
+
+# macOS
+.DS_Store
