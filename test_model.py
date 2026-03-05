@@ -123,7 +123,7 @@ if __name__ == "__main__":
     # - "./models/best_model/best_model"
     # - "./models/ppo_mario_100000_steps"
     
-    MODEL_PATH = "best_model"
+    MODEL_PATH = "./models_v2/best_model/best_model"
     NUM_EPISODES = 5
     RENDER = True
     

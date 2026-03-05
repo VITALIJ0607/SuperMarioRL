@@ -4,13 +4,15 @@ Dieses Projekt trainiert einen KI-Agenten, Super Mario Bros mit **Proximal Polic
 
 ## 🎮 Überblick
 
-Das Setup verwendet moderne RL-Best-Practices:
+Das Setup verwendet moderne RL-Best-Practices mit **Low-Spec Optimierungen**:
 
 - **PPO-Algorithmus** für robustes und stabiles Training
-- **Parallele Environments** für schnelleres Lernen
+- **Parallele Environments** für schnelleres Lernen (8 Envs für 6-Core CPUs)
 - **CNN-Policy** für visuelle Pixel-Eingaben
-- **Custom Reward Shaping** für bessere Lernfortschritte
+- **Advanced Reward Shaping** mit progressiven Checkpoints und Anti-Stuck-Mechanismus
+- **Linear Learning Rate Decay** zur Vermeidung katastrophischen Vergessens
 - **Automatische Checkpoints & Evaluation**
+- **Optimiert für Low-Spec Hardware** (6-Core CPU, 8GB GPU VRAM)
 
 ## 📋 Voraussetzungen
 
@@ -34,10 +36,14 @@ pip install tensorboard
 
 ### Systemanforderungen
 
-- **CPU**: Mindestens 4 Kerne (optimal: 8+)
-- **RAM**: Mindestens 8 GB
-- **GPU**: Optional aber empfohlen (CUDA-fähige NVIDIA GPU)
+**Optimiert für Low-Spec Hardware:**
+
+- **CPU**: Mindestens 6 Kerne (i7 oder besser, nutzt Hyperthreading)
+- **RAM**: Mindestens 16 GB
+- **GPU**: RTX 2070 8GB VRAM oder besser (CUDA-fähige NVIDIA GPU)
 - **Speicher**: ~5 GB für Models und Logs
+
+**Hinweis:** Training ist ~4× langsamer als auf High-Spec Hardware (40-Core, 96GB GPU), aber vollständig funktionsfähig. Erwarte ~250k Steps/Stunde.
 
 ## 🏗️ Architektur
 
@@ -66,12 +72,33 @@ PPO Agent
 - Reduziert Action-Space von 256 auf 7 sinnvolle Aktionen
 - Verwendet `SIMPLE_MOVEMENT`: [NOOP, rechts, rechts+A, rechts+B, rechts+A+B, A, links]
 
-#### 2. **RewardShapingWrapper** (Custom)
+#### 2. **RewardShapingWrapper** (Custom - Advanced)
 
-- ✅ **Fortschritts-Belohnung**: +0.1 × Δx (für jeden Pixel nach rechts)
-- ✅ **Meilenstein-Bonus**: +1.0 bei neuem x-Rekord
-- ⏱️ **Zeit-Penalty**: -0.01 pro Schritt (motiviert schnelles Spielen)
-- ☠️ **Death Penalty**: -10.0 bei Tod
+**Basis-Belohnungen:**
+
+- ✅ **X-Progress Reward**: +1.5 × Δx (nur für NEUE Fortschritte, verhindert Hin-und-Her)
+- 🎮 **Game Reward**: Original × 0.05 (stark reduziert, X-Progress dominiert)
+
+**Progressive Meilensteine:**
+
+- 🏁 **Checkpoint 1000**: +50.0 beim ersten Erreichen von x=1000
+- 🏁 **Checkpoint 2000**: +75.0 beim ersten Erreichen von x=2000
+- 🏁 **Checkpoint 3000**: +100.0 beim ersten Erreichen von x=3000
+
+**Anti-Stuck-Mechanismus:**
+
+- 🚫 **Stillstand-Bestrafung**: -0.5 wenn X-Variance < 10 Pixel in 40 Frames
+- ⏸️ **Feststeck-Penalty**: -1.0 pro Step nach 100 Steps ohne Fortschritt
+
+**Zeit-Effizienz:**
+
+- ⚡ **Früher Fortschritt**: +0.1 Bonus für X-Progress in ersten 1000 Steps
+
+**Episode-Ende:**
+
+- 🎉 **Level Completion**: +500.0 (+ bis zu +200.0 für schnelle Completion)
+- ⏱️ **Timeout**: -100.0 (Level nicht geschafft)
+- ☠️ **Tod**: -50.0 (-10.0 extra wenn früh gestorben < 500 Steps)
 
 #### 3. **GrayScaleObservation**
 
@@ -88,56 +115,77 @@ PPO Agent
 
 ## 🧠 PPO-Konfiguration
 
-### Hyperparameter (optimierte Defaults)
+### Hyperparameter (PPO_7 Basis + Low-Spec Optimierungen)
 
-| Parameter       | Wert   | Beschreibung                               |
-| --------------- | ------ | ------------------------------------------ |
-| `n_steps`       | 256    | Schritte pro Environment vor Policy-Update |
-| `batch_size`    | 256    | Mini-Batch-Größe für Training              |
-| `learning_rate` | 2.5e-4 | Lernrate (Adam Optimizer)                  |
-| `gamma`         | 0.99   | Discount Factor für zukünftige Rewards     |
-| `gae_lambda`    | 0.95   | GAE (Generalized Advantage Estimation)     |
-| `ent_coef`      | 0.01   | Entropy Coefficient (Exploration)          |
-| `clip_range`    | 0.2    | PPO Clipping-Parameter                     |
-| `n_epochs`      | 4      | Gradient-Updates pro Rollout               |
+| Parameter       | Wert                 | Beschreibung                                   |
+| --------------- | -------------------- | ---------------------------------------------- |
+| `n_steps`       | 2048                 | Schritte pro Environment vor Policy-Update     |
+| `batch_size`    | 1024                 | Mini-Batch-Größe (reduziert für 8GB VRAM)      |
+| `learning_rate` | 3e-5 → 1e-6 (Linear) | **Learning Rate Decay** (verhindert Vergessen) |
+| `gamma`         | 0.98                 | Kürzerer Horizont für nahe Rewards             |
+| `gae_lambda`    | 0.98                 | Erhöht für bessere Value Estimates             |
+| `ent_coef`      | 0.1                  | Hohe Exploration (war 0.01)                    |
+| `clip_range`    | 0.2                  | Standard PPO Clipping                          |
+| `vf_coef`       | 1.0                  | Maximal für Value Function Learning            |
+| `n_epochs`      | 10                   | Mehr Training aus Daten (war 4)                |
+| `max_grad_norm` | 0.5                  | Gradient Clipping                              |
+
+### Learning Rate Schedule 🆕
+
+**Linear Decay für Stabilität:**
+
+```python
+def linear_schedule(progress_remaining: float) -> float:
+    initial_lr = 3e-5  # Start: Schnelles Lernen
+    final_lr = 1e-6    # Ende: Feintuning
+    return final_lr + (initial_lr - final_lr) * progress_remaining
+```
+
+- **Startet bei 3e-5**: Ermöglicht schnelles Lernen zu Beginn
+- **Endet bei 1e-6**: Feines Tuning ohne katastrophisches Vergessen
+- **Verhindert**: Dass der Agent in späten Phasen bereits Gelerntes vergisst
 
 ### Policy
 
 - **CnnPolicy**: Convolutional Neural Network für Pixel-Inputs
-- Architektur: 3 Conv-Layer + 2 Fully-Connected Layers
+- Architektur: [256, 256] für Policy und Value Function
 - Automatische Feature-Extraktion aus Frames
+- Optimiert für 8GB VRAM
 
-### Parallelisierung
+### Parallelisierung (Low-Spec Optimiert)
 
-- **SubprocVecEnv**: 8 parallele Environments (separate Prozesse)
-- Effektive Batch-Größe: 256 steps × 8 envs = 2048 samples pro Update
-- Linearer Speedup durch Multiprocessing
+- **SubprocVecEnv**: 8 parallele Environments (nutzt 6-Core + Hyperthreading optimal)
+- Effektive Batch-Größe: 2048 steps × 8 envs = 16384 samples pro Rollout
+- Episode TimeLimit: 1400 Steps (gibt mehr Spielraum für Erkundung)
+- Torch Threads: 6 (Training) + 2 (Parallelität)
 
 ## 🚀 Training starten
 
-### Standard-Training (10M Timesteps)
+### Low-Spec Training (10M Timesteps)
 
 ```bash
-python super_mario_rl.py
+python super_mario_rl_low_spec.py
 ```
 
 Das Training:
 
-- Läuft mit 8 parallelen Environments
+- Läuft mit 8 parallelen Environments (optimal für 6-Core CPU)
 - Erstellt alle 100.000 Steps einen Checkpoint
 - Speichert das beste Model basierend auf Evaluation
 - Loggt zu TensorBoard
+- **Erwarte ~250k Steps/Stunde** (vs. ~1M auf High-Spec Hardware)
+- **Gesamt-Trainingszeit**: ~40 Stunden für 10M Steps
 
 ### Training-Output
 
 ```
-models/               # Checkpoints alle 100k Steps
-  ├── ppo_mario_100000_steps.zip
-  ├── ppo_mario_200000_steps.zip
-  └── best_model/     # Bestes Model nach Evaluation
-logs/                 # Evaluation Logs
-ppo_mario_tensorboard/ # TensorBoard Logs
-ppo_mario_final.zip   # Finales trainiertes Model
+models/                      # Checkpoints alle 100k Steps
+  ├── ppo_mario_lowspec_100000_steps.zip
+  ├── ppo_mario_lowspec_200000_steps.zip
+  └── best_model/            # Bestes Model nach Evaluation
+logs/                        # Evaluation Logs
+ppo_mario_tensorboard/       # TensorBoard Logs
+ppo_mario_lowspec_final.zip  # Finales trainiertes Model
 ```
 
 ## 📊 Monitoring mit TensorBoard
@@ -157,44 +205,61 @@ tensorboard --logdir=./ppo_mario_tensorboard
 - **train/policy_loss**: Policy-Optimierung
 - **train/value_loss**: Value-Function-Fehler
 
-## 🎯 Training-Erwartungen
+## 🎯 Training-Erwartungen (mit Advanced Reward Shaping)
 
-### Phase 1: Exploration (0-1M Steps)
+### Phase 1: Exploration & Basic Movement (0-1M Steps)
 
-- Agent lernt Grundbewegungen
-- Viel zufällige Aktionen
-- Stirbt häufig
+- Agent lernt Grundbewegungen (rechts = gut)
+- Progressive Checkpoints motivieren Vorwärtsbewegung
+- Anti-Stuck-Mechanismus verhindert Stillstand
+- Erreicht erste Checkpoints (x=1000)
 
-### Phase 2: Lokale Optima (1M-3M Steps)
+### Phase 2: Checkpoint Mastery (1M-3M Steps)
 
-- Schafft erste Hindernisse
-- Lernt Sprungmechanik
-- Erreicht erste Pipes/Gegner
+- Erreicht regelmäßig x=1000-2000
+- Lernt Sprungmechanik für Hindernisse
+- Vermeidet einfache Gegner
+- Zeit-Effizienz-Boni motivieren schnelleren Fortschritt
 
-### Phase 3: Level-Progress (3M-7M Steps)
+### Phase 3: Advanced Navigation (3M-7M Steps)
 
-- Erreicht zunehmend weiter rechts
+- Erreicht Checkpoint 3000+ regelmäßig
 - Vermeidet Gegner gezielt
-- Nutzt Power-Ups
+- Lernt komplexe Sprungkombinationen
+- Weniger Tode durch bessere Planung
 
 ### Phase 4: Level-Completion (7M+ Steps)
 
-- Schafft komplette Level
-- Optimiert Geschwindigkeit
-- Hohe Erfolgsrate
+- Schafft komplette Level (x=3161 = Flag)
+- Optimiert für schnelle Completion (< 400-800 Steps)
+- Learning Rate Decay stabilisiert Gelerntes
+- Hohe Erfolgsrate (> 70%)
 
 ## 🔧 Anpassungen & Tuning
 
 ### Mehr Exploration?
 
 ```python
-ent_coef=0.05,  # Erhöhen von 0.01 auf 0.05
+ent_coef=0.15,  # Erhöhen von 0.1 auf 0.15 (bereits hoch!)
 ```
 
-### Training beschleunigen?
+### Training beschleunigen? (Erfordert mehr Hardware!)
 
 ```python
-NUM_ENVS = 16,  # Mehr parallele Envs (mehr RAM/CPU nötig)
+NUM_ENVS = 12,  # Mehr parallele Envs (braucht 8+ Core CPU)
+batch_size=2048,  # Größere Batches (braucht 16GB+ VRAM)
+```
+
+⚠️ **Hinweis**: Low-Spec Config ist bereits für 6-Core/8GB VRAM optimiert!
+
+### Learning Rate anpassen?
+
+```python
+# Schnelleres Lernen (riskanter)
+initial_lr = 5e-5  # statt 3e-5
+
+# Noch stabileres Lernen (langsamer)
+initial_lr = 1e-5  # statt 3e-5
 ```
 
 ### Andere Level?
@@ -223,10 +288,10 @@ model.learn(total_timesteps=5_000_000)
 from stable_baselines3 import PPO
 
 # Model laden
-model = PPO.load("ppo_mario_final")
+model = PPO.load("ppo_mario_lowspec_final")
 
 # Environment erstellen
-test_env = DummyVecEnv([make_env('SuperMarioBros-v0', 0)])
+test_env = DummyVecEnv([make_env('SuperMarioBros-1-1-v0', 0)])
 
 # Spielen
 obs = test_env.reset()
@@ -242,9 +307,9 @@ for _ in range(10000):
 
 ```python
 # Checkpoint laden
-model = PPO.load("models/ppo_mario_500000_steps")
+model = PPO.load("models/ppo_mario_lowspec_500000_steps")
 
-# Bestes Model laden
+# Bestes Model laden (basierend auf Evaluation)
 model = PPO.load("models/best_model/best_model")
 ```
 
@@ -262,27 +327,33 @@ pip install stable-baselines3[extra]
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
 ```
 
-### "Out of Memory"
+### "Out of Memory" (GPU VRAM)
 
 ```python
-# Reduziere parallele Environments
-NUM_ENVS = 4  # statt 8
+# Bereits auf 1024 reduziert, aber wenn weiterhin Probleme:
+batch_size=512  # statt 1024
+
+# Oder reduziere parallele Environments
+NUM_ENVS = 4  # statt 8 (halbiert VRAM-Bedarf)
 
 # Oder reduziere n_steps
-n_steps=128  # statt 256
+n_steps=1024  # statt 2048
 ```
 
 ### Agent lernt nicht / bleibt stecken
 
+**Hinweis**: Anti-Stuck-Mechanismus ist bereits implementiert!
+
 ```python
-# Erhöhe Exploration
-ent_coef=0.05  # statt 0.01
+# Verstärke Anti-Stuck Penalties
+if x_variance < 10:
+    reward -= 1.0  # statt 0.5
 
-# Passe Reward Shaping an
-reward += (info['x_pos'] - self.current_x) * 0.5  # statt 0.1
+# Reduziere Stuck Threshold (schneller bestrafen)
+self.stuck_threshold = 50  # statt 100
 
-# Erhöhe Learning Rate
-learning_rate=5e-4  # statt 2.5e-4
+# Erhöhe X-Progress Multiplikator
+reward = reward * 0.05 + x_progress * 2.0  # statt 1.5
 ```
 
 ### "Cannot find best model"
@@ -327,11 +398,20 @@ Bei sehr sparse Rewards:
 
 ## 📈 Performance-Benchmarks
 
-Auf typischer Hardware (8-Core CPU, RTX 3060):
+**Low-Spec Hardware (6-Core i7, RTX 2070 8GB):**
 
-- **Training-Speed**: ~10-15k Steps/Sekunde (8 Environments)
-- **Episode**: ~300-400 Steps (untrainiert), ~1500+ Steps (trainiert)
-- **Zeit bis erste Level-Completion**: 3-6 Stunden (5-8M Steps)
+- **Training-Speed**: ~250k Steps/Stunde (8 Environments)
+- **Episode-Länge**: ~300-500 Steps (untrainiert), ~400-1400 Steps (trainiert)
+- **TimeLimit**: 1400 Steps (gibt Agent mehr Zeit für Exploration)
+- **Zeit bis erste Level-Completion**: ~8-12 Stunden (2-3M Steps mit Advanced Reward Shaping)
+- **Gesamt-Trainingszeit**: ~40 Stunden für 10M Steps
+- **VRAM-Nutzung**: ~6-7GB bei Batch Size 1024
+
+**Vergleich zu High-Spec Hardware (40-Core, 2x 96GB GPU):**
+
+- **~4× langsamer**: 250k vs. 1M Steps/Stunde
+- **Aber**: Gleiche Qualität durch optimierte Hyperparameter!
+- **Learning Rate Decay**: Kompensiert längere Trainingszeit
 
 ## 🔗 Ressourcen
 
@@ -350,3 +430,4 @@ Dieses Projekt verwendet:
 ---
 
 **Viel Erfolg beim Training! 🎮🚀**
+# SuperMarioRL

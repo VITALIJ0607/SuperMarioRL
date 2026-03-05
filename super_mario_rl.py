@@ -4,9 +4,17 @@ import gym_super_mario_bros
 from gym_super_mario_bros.actions import SIMPLE_MOVEMENT
 from gym.wrappers import GrayScaleObservation, ResizeObservation, FrameStack
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
 import numpy as np
+import os
+import torch
+
+# GPU-Konfiguration für maximale Auslastung
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'  # Nutze primäre GPU (beide verfügbar: 0,1)
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'  # Synchrones Execution
+torch.set_num_threads(32)  # 40 CPU-Cores: 32 für optimale Performance
+torch.set_num_interop_threads(8)  # Parallelität für Ops
 
 
 # Wrapper um überflüssige Dimensionen zu entfernen
@@ -50,34 +58,25 @@ class GymCompatibilityWrapper(gym.Wrapper):
 class RewardShapingWrapper(gym.Wrapper):
     def __init__(self, env):
         super(RewardShapingWrapper, self).__init__(env)
-        self.current_x = 0
-        self.max_x = 0
+        self.prev_x = 0
         
     def reset(self, **kwargs):
-        self.current_x = 0
-        self.max_x = 0
-        # Gibt nur obs zurück (alte gym API)
+        self.prev_x = 0
         return self.env.reset()
     
     def step(self, action):
         state, reward, done, info = self.env.step(action)
         
-        # Belohnung für Fortschritt in x-Richtung
+        # MAXIMAL VEREINFACHT: Nur rohe X-Position als Reward!
         if 'x_pos' in info:
-            reward += (info['x_pos'] - self.current_x) * 0.1
-            self.current_x = info['x_pos']
-            
-            # Bonus für neuen Rekord
-            if info['x_pos'] > self.max_x:
-                self.max_x = info['x_pos']
-                reward += 1.0
+            # Belohnung = Fortschritt seit letztem Step
+            x_progress = (info['x_pos'] - self.prev_x)
+            reward = x_progress * 1.0  # VERSTÄRKTES Signal für klares Lernen!
+            self.prev_x = info['x_pos']
         
-        # Kleiner Zeit-Penalty um schnelleres Vorankommen zu fördern
-        reward -= 0.001
-        
-        # Death penalty
-        if done and info.get('flag_get', False) == False:
-            reward -= 5.0
+        # Großer Bonus bei Level-Completion
+        if done and info.get('flag_get', False):
+            reward += 100.0
             
         return state, reward, done, info
 
@@ -94,6 +93,10 @@ def make_env(env_id, rank, seed=0):
         env = ResizeObservation(env, shape=84)
         env = FrameStack(env, num_stack=4)
         env = SqueezeObservation(env)  # NACH FrameStack! Entfernt (4,84,84,1) -> (4,84,84)
+        
+        # WICHTIG: Max Episode Length begrenzen (verhindert 8019-step Timeouts)
+        env = gym.wrappers.TimeLimit(env, max_episode_steps=2000)  # ~100 Sekunden
+        
         env = GymCompatibilityWrapper(env)  # NACH gym-Wrappern, konvertiert zu neuem API
         # Seed wird jetzt beim reset() gesetzt (gym >= 0.26)
         env.action_space.seed(seed + rank)
@@ -103,38 +106,51 @@ def make_env(env_id, rank, seed=0):
 
 
 if __name__ == "__main__":
-    # Konfiguration für optimale GPU-Nutzung
-    NUM_ENVS = 16  # Erhöht für RTX 4090 + 32GB RAM
-    TOTAL_TIMESTEPS = 20_000_000  # Trainingsschritte (erhöht für bessere Ergebnisse)
-    SAVE_FREQ = 100_000  # Checkpoint-Frequenz
-    EPISODES = 5000  # Anzahl der Schritte für Test-Episode
-    N_STEPS = 512  # Balance: Genug Daten für GPU, nicht zu lange Rollouts
+    # ===== HARDWARE-SPEZIFISCHE KONFIGURATION =====
+    # CPU: 40 Cores, RAM: 196GB, GPU: 2x RTX Pro 6000 Blackwell 96GB
+    # =============================================
+    NUM_ENVS = 32  # Optimal für 40 CPU Cores (32 parallele Envs)
+    TOTAL_TIMESTEPS = 20_000_000
+    SAVE_FREQ = 100_000
+    EPISODES = 5000
+    N_STEPS = 2048  # 32*2048 = 65536 steps per rollout - mehr diverse Samples!
     
     # Erstelle parallele Environments
-    # DummyVecEnv statt SubprocVecEnv wegen numpy-Kompatibilitätsproblemen
+    # SubprocVecEnv: Nutzt alle CPU-Cores für echte Parallelisierung
     env_id = 'SuperMarioBros-1-1-v0'  # Spezifisches Level 1-1 (einfachstes Level)
-    envs = DummyVecEnv([make_env(env_id, i) for i in range(NUM_ENVS)])
+    
+    # Verwende SubprocVecEnv für bessere Parallelisierung
+    try:
+        envs = SubprocVecEnv([make_env(env_id, i) for i in range(NUM_ENVS)])
+        print(f"✅ SubprocVecEnv lädt... (nutzt mehrere CPU-Cores)")
+    except Exception as e:
+        print(f"⚠️  SubprocVecEnv fehlgeschlagen, fallback zu DummyVecEnv: {e}")
+        envs = DummyVecEnv([make_env(env_id, i) for i in range(NUM_ENVS)])
     
     # Erstelle Evaluation Environment
     eval_env = DummyVecEnv([make_env(env_id, 0)])
     
-    # PPO Model mit optimaler GPU-Auslastung
+    # Erstelle PPO Model mit optimierten Hyperparametern
+    # PPO_5: Fix für Explained Variance = 0% Problem
     model = PPO(
         policy='CnnPolicy',
         env=envs,
-        n_steps=N_STEPS,                # 512 steps - Balance zwischen GPU-Nutzung und Stabilität
-        batch_size=1024,                # Groß genug für GPU, aber 8 Batches statt 4
-        learning_rate=2.5e-4,           # Learning rate
-        gamma=0.99,                     # Discount factor
-        gae_lambda=0.95,                # GAE parameter
-        ent_coef=0.01,                  # Entropy coefficient (reduziert für Stabilität)
-        clip_range=0.2,                 # PPO clip range
-        n_epochs=10,                    # 10 Epochen - Kompromiss zwischen GPU-Last und Overfitting
-        verbose=1,                      # Ausgabe während Training
+        n_steps=N_STEPS,                # 2048 steps × 32 envs = 65536 samples!
+        batch_size=2048,                # Optimal für Stabilität (2048-4096 ist sweet spot)
+        learning_rate=1e-4,             # ↓↓ DEUTLICH niedriger (war 2.5e-4) - vorsichtiges Lernen!
+        gamma=0.98,                     # ↓ Kürzerer Horizont (war 0.99) - fokussiert auf nahe Rewards
+        gae_lambda=0.98,                # ↑ Erhöht für bessere Value Estimates (war 0.95)
+        ent_coef=0.05,                  # ↑↑ MEHR Exploration (war 0.01) - Agent soll mehr probieren!
+        clip_range=0.2,                 # Standard PPO
+        vf_coef=1.0,                    # ↑↑ MAXIMAL für Value Function Learning!
+        max_grad_norm=0.5,              # Gradient Clipping
+        n_epochs=10,                    # ↑↑ Mehr Training aus Daten (war 4)
+        verbose=1,
         tensorboard_log="./ppo_mario_tensorboard/",
-        device='cuda',                  # Explizit GPU nutzen (RTX 4090)
+        device='cuda',
         policy_kwargs=dict(
-            net_arch=dict(pi=[256, 256, 256], vf=[256, 256, 256])  # Größeres Netzwerk, aber nicht übertrieben
+            net_arch=dict(pi=[256, 256], vf=[256, 256]),
+            normalize_images=False
         )
     )
     
@@ -157,14 +173,22 @@ if __name__ == "__main__":
         eval_env,
         best_model_save_path='./models/best_model/',
         log_path='./logs/',
-        eval_freq=10000 // NUM_ENVS,
+        eval_freq=5000 // NUM_ENVS,  # ↑ Früher evaluieren (war 10000, jetzt alle ~160k steps)
         deterministic=True,
-        render=False
+        render=False,
+        n_eval_episodes=5  # 5 Episodes für stabilere Evaluation
     )
     
     # Training starten
-    print(f"Starte Training mit {NUM_ENVS} parallelen Environments...")
+    print(f"\n{'='*70}")
+    print(f"STARTE TRAINING PPO_3")
+    print(f"{'='*70}")
+    print(f"Environments: {NUM_ENVS} parallel")
     print(f"Gesamte Timesteps: {TOTAL_TIMESTEPS:,}")
+    print(f"Samples pro Rollout: {NUM_ENVS * N_STEPS:,}")
+    print(f"Evaluation alle: {5000 // NUM_ENVS * NUM_ENVS:,} steps")
+    print(f"{'='*70}\n")
+    
     model.learn(
         total_timesteps=TOTAL_TIMESTEPS,
         callback=[checkpoint_callback, eval_callback]
@@ -177,18 +201,3 @@ if __name__ == "__main__":
     # Cleanup
     envs.close()
     eval_env.close()
-    
-    # Optional: Teste das trainierte Model
-    print("\nTeste das trainierte Model...")
-    test_env = DummyVecEnv([make_env(env_id, 0)])
-    obs = test_env.reset()
-    
-    for _ in range(EPISODES):
-        action, _states = model.predict(obs, deterministic=True)
-        obs, rewards, dones, info = test_env.step(action)
-        test_env.render()
-        
-        if dones[0]:
-            obs = test_env.reset()
-    
-    test_env.close()
